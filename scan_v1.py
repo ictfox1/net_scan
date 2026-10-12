@@ -41,6 +41,44 @@ PORT_HINTS = {
     8080: "http", 27017: "mongodb",
 }
 
+MAX_BANNER_BYTES = 65536
+IDLE_TIMEOUT = 0.5
+
+def make_ssl_context() -> ssl.SSLContext:
+    """For a scanner we intentionally do NOT verify certs — via public API."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+def _safe_decode(data: bytes) -> str:
+    if not data:
+        return "unknown"
+    try:
+        return data.decode("utf-8").strip()
+    except UnicodeDecodeError:
+        return  f"<binary {len(data)} bytes>"
+
+
+def _recv_all(sock: socket.socket, max_bytes: int = MAX_BANNER_BYTES,
+                idle_timeout: float = IDLE_TIMEOUT) -> bytes:
+    """Read until EOF, idle timeout, or max_bytes. Returns all bytes read."""
+    chunks: list[bytes] = []
+    total = 0
+    sock.settimeout(idle_timeout)
+    while total < max_bytes:
+        try:
+            chunk = sock.recv(min(4096, max_bytes - total))
+        except (socket.timeout, BlockingIOError):
+            break
+        except OSError:
+            break
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
 def detect_service(banner: str, port: int) -> tuple[str | None, str | None]:
     if banner and banner != "unknown":
         for name, pattern in SERVICE_PATTERNS:
@@ -61,19 +99,19 @@ def scan_port(ip: str, port: int, timeout: float, probe: str | None = None) -> P
         try:
             payload = probe if probe else DEFAULT_PROBES.get(port)
             if port == 443:
-                ctx = ssl._create_unverified_context()
+                ctx = make_ssl_context()
                 with ctx.wrap_socket(s, server_hostname=ip) as ss:
                     if payload:
                         ss.sendall(payload.encode())
-                    data = ss.recv(4096)
+                    data = _recv_all(ss)
             else:
                 if payload:
                     s.sendall(payload.encode())
-                data = s.recv(4096)
+                data = _recv_all(s)
             if data:
-                banner = data.decode(errors="replace").strip()
+                banner = _safe_decode(data)
         except OSError as e:
-            logging.debug("Port %s: %d", port, e)
+            logging.debug("Port %s: %s", port, e)
 
         service, version = detect_service(banner, port)
         return PortResult(port, "open", banner, service, version)
@@ -109,15 +147,15 @@ def parse_ports(ports: str) -> list[int]:
             if '-' in part:
                 start, end = map(int, part.split('-', 1))
                 if not (1 <= start <= end <= 65535):
-                    raise argparse.ArgumentTypeError("Invalid port range: %s", part)
+                    raise argparse.ArgumentTypeError(f"Invalid port range: {part!r}")
                 result.extend(range(start, end + 1))
             else:
                 p = int(part)
                 if not (1 <= p <= 65535):
-                    raise argparse.ArgumentTypeError("Invalid port: %s", part)
+                    raise argparse.ArgumentTypeError(f"Invalid port: {part!r}")
                 result.append(p)
         except ValueError as e:
-            raise argparse.ArgumentTypeError("Invalid port spec: %s", part) from e
+            raise argparse.ArgumentTypeError(f"Invalid port spec: {part!r}") from e
 
     if not result:
         raise argparse.ArgumentTypeError("No ports specified")
