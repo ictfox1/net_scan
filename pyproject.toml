@@ -1,0 +1,12 @@
+[project]
+name = "net-scan"
+version = "0.1.0"
+description = "TCP scanner with banner grabbing and service detection"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
