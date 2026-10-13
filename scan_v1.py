@@ -8,6 +8,8 @@ import json
 import re
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
+import time
+import threading
 
 @dataclass
 class PortResult:
@@ -18,9 +20,9 @@ class PortResult:
     version: str | None
 
 DEFAULT_PROBES = {
-    80:   "HEAD / HTTP/1.0\r\n\r\n",
-    8080: "HEAD / HTTP/1.0\r\n\r\n",
-    443:  "HEAD / HTTP/1.0\r\n\r\n",
+    80:   "HEAD / HTTP/1.0\r\nHost: {host}\r\n\r\n",
+    8080: "HEAD / HTTP/1.0\r\nHost: {host}\r\n\r\n",
+    443:  "HEAD / HTTP/1.0\r\nHost: {host}\r\n\r\n",
 }
 
 SERVICE_PATTERNS = [
@@ -44,7 +46,21 @@ PORT_HINTS = {
 MAX_BANNER_BYTES = 65536
 IDLE_TIMEOUT = 0.5
 
-def make_ssl_context() -> ssl.SSLContext:
+class RateLimiter:
+    def __init__(self, interval: float):
+        self.interval = interval
+        self._lock = threading.Lock()
+        self._last = time.monotonic() - interval # чтобы 1 поток не спал
+
+    def wait(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            delta = now - self._last
+            if delta < self.interval:
+                time.sleep(self.interval - delta)
+            self._last = time.monotonic() 
+
+def _make_ssl_context() -> ssl.SSLContext:
     """For a scanner we intentionally do NOT verify certs — via public API."""
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -88,39 +104,53 @@ def detect_service(banner: str, port: int) -> tuple[str | None, str | None]:
                 return name, version
     return PORT_HINTS.get(port), None
 
-def scan_port(ip: str, port: int, timeout: float, probe: str | None = None) -> PortResult | None:
-    """Return (port, banner) if the port is open, else None."""
+def _scan_port_once(ip, port, timeout, probe):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(timeout)
         if s.connect_ex((ip, port)) != 0:
             return None
 
-        banner = "unknown"
-        try:
-            payload = probe if probe else DEFAULT_PROBES.get(port)
-            if port == 443:
-                ctx = make_ssl_context()
-                with ctx.wrap_socket(s, server_hostname=ip) as ss:
-                    if payload:
-                        ss.sendall(payload.encode())
-                    data = _recv_all(ss)
-            else:
-                if payload:
-                    s.sendall(payload.encode())
-                data = _recv_all(s)
-            if data:
-                banner = _safe_decode(data)
-        except OSError as e:
-            logging.debug("Port %s: %s", port, e)
+        payload = probe or DEFAULT_PROBES.get(port)
+        if payload and "{host}" in payload:
+            payload = payload.format(host=ip)
 
+        if port == 443:
+            ctx = _make_ssl_context()
+            with ctx.wrap_socket(s, server_hostname=ip) as ss:
+                if payload:
+                    ss.sendall(payload.encode())
+                data = _recv_all(ss)
+        else:
+            if payload:
+                s.sendall(payload.encode())
+            data = _recv_all(s)
+
+        banner = _safe_decode(data)
         service, version = detect_service(banner, port)
         return PortResult(port, "open", banner, service, version)
+def scan_port(ip: str, port: int, timeout: float, probe: str | None = None, rate_limiter: RateLimiter | None = None, retries: int = 2) -> PortResult | None:
+    if rate_limiter:
+        rate_limiter.wait()
 
-def scan(ip: str, ports: list[int], timeout: float, threads: int, probe: str | None = None) -> list[PortResult]:
+    last_error: OSError | None = None
+    for attempt in range(retries + 1):
+        try:
+            return _scan_port_once(ip, port, timeout, probe)
+        except OSError as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(0.2 * (2 ** attempt))
+    if last_error:
+        logging.debug("Port %d: %s", port, last_error)
+    return None
+
+def scan(ip: str, ports: list[int], timeout: float, threads: int, probe: str | None = None, rate_limit: float = 0.0) -> list[PortResult]:
     """Scan a range of ports concurrently"""
     results: list[PortResult] = []
+    rate_limiter = RateLimiter(rate_limit) if rate_limit > 0 else None
+
     with cct.ThreadPoolExecutor(max_workers=threads) as pool:
-        futures = [pool.submit(scan_port, ip, p, timeout, probe) for p in ports]
+        futures = [pool.submit(scan_port, ip, p, timeout, probe, rate_limiter) for p in ports]
         try:
             for future in cct.as_completed(futures):
                 res = future.result()
@@ -173,6 +203,12 @@ def positive_float(value: float) -> float:
         raise argparse.ArgumentTypeError("must be > 0")
     return n
 
+def non_negative_float(value: str) -> float:
+    n = float(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return n
+
 def build_report(host: str, ip: str, results: list[PortResult]) -> dict:
     return {
         "target": host,
@@ -195,6 +231,8 @@ def main() -> int:
                         help="optional raw probe string to send after connecting")
     parser.add_argument("--threads", type=positive_int, default=100, 
                         help="count of workers (default: 100)")
+    parser.add_argument("--rate-limit", type=non_negative_float, default=0.0,
+                        help="min seconds between connection attempts (default: 0)")
     parser.add_argument("-o", "--output",
                         help="save results to JSON file")
     args = parser.parse_args()
@@ -209,7 +247,7 @@ def main() -> int:
     logging.info('[*] Scanning %s (%s), %d ports', args.host, target_ip, len(ports))
 
     try:
-        open_ports = scan(target_ip, ports, args.timeout, args.threads, args.probe)
+        open_ports = scan(target_ip, ports, args.timeout, args.threads, args.probe, args.rate_limit)
     except KeyboardInterrupt:
         logging.warning('Scanning interrupted by user')
         return 2
